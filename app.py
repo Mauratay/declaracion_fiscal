@@ -17,71 +17,181 @@ import streamlit as st
 import pdfplumber
 import re
 import pandas as pd
+import os
+import glob
+from PIL import Image
+import pytesseract
+import xml.etree.ElementTree as ET
 
-def extraer_texto_pdf(archivo_en_memoria):
+def extraer_texto_archivo(archivo):
     texto_completo = ""
+    nombre = getattr(archivo, 'name', str(archivo)).lower()
+
     try:
-        with pdfplumber.open(archivo_en_memoria) as pdf:
-            for pagina in pdf.pages:
-                texto_extraido = pagina.extract_text()
-                if texto_extraido:
-                    texto_completo += texto_extraido + "\n"
+        if nombre.endswith('.pdf'):
+            with pdfplumber.open(archivo) as pdf:
+                for pagina in pdf.pages:
+                    texto_extraido = pagina.extract_text()
+                    if texto_extraido:
+                        texto_completo += texto_extraido + "\n"
+        elif nombre.endswith(('.png', '.jpg', '.jpeg')):
+            img = Image.open(archivo)
+            texto_completo = pytesseract.image_to_string(img)
+        elif nombre.endswith('.xml'):
+            if isinstance(archivo, str):
+                with open(archivo, 'r', encoding='utf-8') as f:
+                    contenido = f.read()
+            else:
+                archivo.seek(0)
+                contenido = archivo.read().decode('utf-8')
+            
+            texto_completo = contenido
+            
+            try:
+                root = ET.fromstring(contenido)
+                
+                for elem in root.iter():
+                    if 'Descripcion' in elem.attrib:
+                        texto_completo += f"\nDescripción: {elem.attrib['Descripcion']}\n"
+                    if 'Nombre' in elem.attrib:
+                        texto_completo += f"\nNombre: {elem.attrib['Nombre']}\n"
+                        
+                    if 'FechaPago' in elem.attrib:
+                        fecha_val = elem.attrib['FechaPago']
+                        if len(fecha_val) >= 10:
+                            f = fecha_val[:10].split('-')
+                            if len(f) >= 3:
+                                texto_completo += f"\nFecha de pago {f[2]}/{f[1]}/{f[0]}\n"
+                                
+                    if 'Fecha' in elem.attrib:
+                        fecha_val = elem.attrib['Fecha']
+                        if len(fecha_val) >= 10:
+                            f = fecha_val[:10].split('-')
+                            if len(f) >= 3:
+                                texto_completo += f"\nFecha {f[2]}/{f[1]}/{f[0]}\n"
+                    
+                    if 'TotalSueldos' in elem.attrib:
+                        texto_completo += f"\nTotal percepciones {elem.attrib['TotalSueldos']}\n"
+                    elif 'TotalPercepciones' in elem.attrib:
+                        texto_completo += f"\nTotal percepciones {elem.attrib['TotalPercepciones']}\n"
+                        
+                    if 'TotalImpuestosRetenidos' in elem.attrib:
+                        texto_completo += f"\nTotal impuestos retenidos {elem.attrib['TotalImpuestosRetenidos']}\n"
+
+                total = root.get('Total')
+                if total:
+                    texto_completo += f"\nTotal final factura médica o escolar: {total}\n"
+                    
+            except Exception:
+                pass
+        else:
+            st.warning(f"Formato no soportado: {nombre}")
+            
     except Exception as e:
-        st.error(f"Error en la lectura del archivo {archivo_en_memoria.name}: {e}")
+        nombre_err = getattr(archivo, 'name', str(archivo))
+        st.error(f"Error en la lectura del archivo {nombre_err}: {e}")
+        
     return texto_completo
 
-def procesar_documentos(archivos_nomina, archivos_medicos):
+def procesar_documentos(archivos, anio_declaracion):
     datos_extraidos = []
     
-    patron_fecha = re.compile(r"Fecha de pago[\"\,\s]*([\d]{2}/[\d]{2}/[\d]{4})", re.IGNORECASE)
+    patron_fecha_pago = re.compile(r"Fecha de pago[\"\,\:\s]*([\d]{2}/[\d]{2}/[\d]{4}|[\d]{4}-[\d]{2}-[\d]{2})", re.IGNORECASE)
+    patron_fecha_general = re.compile(r"Fecha[\"\,\:\s]*([\d]{2}/[\d]{2}/[\d]{4}|[\d]{4}-[\d]{2}-[\d]{2})", re.IGNORECASE)
     patron_ingreso = re.compile(r"Total percepciones[\"\,\s]*([\d,]+\.\d{2})", re.IGNORECASE)
     patron_isr = re.compile(r"Total impuestos retenidos[\"\,\s]*([\d,]+\.\d{2})", re.IGNORECASE)
     patron_cifra_monetaria = re.compile(r"\$?\s*([\d,]+\.\d{2})")
+    
+    patron_escolar = re.compile(r"(colegiatura|escuela|colegio|instituto|universidad|escolar|educativ[oa]|preescolar|primaria|secundaria|preparatoria|bachillerato|instEducativas)", re.IGNORECASE)
 
-    for archivo in archivos_nomina:
-        texto = extraer_texto_pdf(archivo)
+    for archivo in archivos:
+        texto = extraer_texto_archivo(archivo)
         
-        match_fecha = patron_fecha.search(texto)
+        match_fecha_pago = patron_fecha_pago.search(texto)
+        match_fecha_general = patron_fecha_general.search(texto)
+        match_fecha = match_fecha_pago if match_fecha_pago else match_fecha_general
+        
         match_ingreso = patron_ingreso.search(texto)
         match_isr = patron_isr.search(texto)
-
-        fecha = match_fecha.group(1) if match_fecha else "No identificada"
-        ingreso = float(match_ingreso.group(1).replace(",", "")) if match_ingreso else 0.0
-        isr = float(match_isr.group(1).replace(",", "")) if match_isr else 0.0
-
-        datos_extraidos.append({
-            "Tipo": "Nómina", 
-            "Archivo": archivo.name, 
-            "Fecha": fecha, 
-            "Ingresos": ingreso, 
-            "ISR Retenido": isr, 
-            "Deducciones Médicas": 0.0
-        })
-
-    for archivo in archivos_medicos:
-        texto = extraer_texto_pdf(archivo)
-        todas_las_cifras = patron_cifra_monetaria.findall(texto)
         
-        if todas_las_cifras:
-            ultima_cifra = todas_las_cifras[-1]
-            total_factura = float(ultima_cifra.replace(",", ""))
+        nombre_archivo = getattr(archivo, 'name', os.path.basename(archivo) if isinstance(archivo, str) else str(archivo))
+
+        # Validación del año
+        fecha = "No identificada"
+        if match_fecha:
+            fecha_str = match_fecha.group(1)
+            try:
+                if "/" in fecha_str:
+                    anio_doc = int(fecha_str.split("/")[-1])
+                elif "-" in fecha_str:
+                    anio_doc = int(fecha_str.split("-")[0])
+                else:
+                    anio_doc = None
+            except:
+                anio_doc = None
+
+            if anio_doc and anio_doc != anio_declaracion:
+                st.warning(f"Se ignoró '{nombre_archivo}' porque corresponde al año {anio_doc} y no a la declaración del {anio_declaracion}.")
+                continue
+            
+            fecha = fecha_str
+
+        # Una Nómina debe tener explícitamente "Total percepciones" o la palabra "nómina" en su texto.
+        # Las facturas médicas pueden tener retenciones de ISR (pasando match_isr) por honorarios.
+        es_nomina = bool(match_ingreso) or ("nómina" in texto.lower()) or ("nomina" in texto.lower())
+
+        if es_nomina:
+            # Es un recibo de Nómina
+            ingreso = float(match_ingreso.group(1).replace(",", "")) if match_ingreso else 0.0
+            isr = float(match_isr.group(1).replace(",", "")) if match_isr else 0.0
+
             datos_extraidos.append({
-                "Tipo": "Factura Médica", 
-                "Archivo": archivo.name, 
-                "Fecha": "N/A", 
-                "Ingresos": 0.0, 
-                "ISR Retenido": 0.0, 
-                "Deducciones Médicas": total_factura
+                "Tipo": "Nómina", 
+                "Archivo": nombre_archivo, 
+                "Fecha": fecha, 
+                "Ingresos": ingreso, 
+                "ISR Retenido": isr, 
+                "Deducciones Médicas": 0.0,
+                "Deducciones Escolares": 0.0
             })
         else:
-            datos_extraidos.append({
-                "Tipo": "Factura Médica (Error)", 
-                "Archivo": archivo.name, 
-                "Fecha": "N/A", 
-                "Ingresos": 0.0, 
-                "ISR Retenido": 0.0, 
-                "Deducciones Médicas": 0.0
-            })
+            # Es una Factura Médica, Escolar (u otro gasto)
+            todas_las_cifras = patron_cifra_monetaria.findall(texto)
+            
+            if todas_las_cifras:
+                ultima_cifra = todas_las_cifras[-1]
+                total_factura = float(ultima_cifra.replace(",", ""))
+                
+                es_escolar = patron_escolar.search(texto)
+                
+                if es_escolar:
+                    tipo = "Factura Escolar"
+                    ded_medicas = 0.0
+                    ded_escolares = total_factura
+                else:
+                    tipo = "Factura Médica u Otros"
+                    ded_medicas = total_factura
+                    ded_escolares = 0.0
+                    
+                datos_extraidos.append({
+                    "Tipo": tipo, 
+                    "Archivo": nombre_archivo, 
+                    "Fecha": fecha, 
+                    "Ingresos": 0.0, 
+                    "ISR Retenido": 0.0, 
+                    "Deducciones Médicas": ded_medicas,
+                    "Deducciones Escolares": ded_escolares
+                })
+            else:
+                datos_extraidos.append({
+                    "Tipo": "Desconocido (Sin montos)", 
+                    "Archivo": nombre_archivo, 
+                    "Fecha": fecha, 
+                    "Ingresos": 0.0, 
+                    "ISR Retenido": 0.0, 
+                    "Deducciones Médicas": 0.0,
+                    "Deducciones Escolares": 0.0
+                })
             
     return pd.DataFrame(datos_extraidos)
 
@@ -89,26 +199,48 @@ st.set_page_config(page_title="Extractor Fiscal CFDI", layout="wide")
 st.title("Extractor de Datos para Declaración Anual")
 st.markdown("Esta herramienta se ejecuta localmente. Tus archivos no son enviados a ningún servidor.")
 
-st.header("1. Carga de Archivos")
+st.header("1. Configuración y Carga de Archivos")
+
+import datetime
+anio_actual = datetime.datetime.now().year
 col1, col2 = st.columns(2)
-
 with col1:
-    st.subheader("Recibos de Nómina")
-    archivos_nomina = st.file_uploader("Selecciona o arrastra los PDF de nómina", type="pdf", accept_multiple_files=True, key="nomina")
+    anio_declaracion = st.number_input("Año de la declaración fiscal", min_value=2000, max_value=2100, value=anio_actual - 1, step=1)
 
-with col2:
-    st.subheader("Facturas Médicas")
-    archivos_medicos = st.file_uploader("Selecciona o arrastra los PDF de facturas médicas", type="pdf", accept_multiple_files=True, key="medicas")
+modo_carga = st.radio("Método de entrada", ["Archivos", "Carpeta Completa"], horizontal=True)
+
+archivos_procesar = []
+tipos_permitidos = ["pdf", "xml", "png", "jpg", "jpeg"]
+
+if modo_carga == "Archivos":
+    uploaded_files = st.file_uploader("Selecciona o arrastra todos tus documentos fiscales", type=tipos_permitidos, accept_multiple_files=True, key="documentos")
+    if uploaded_files:
+        archivos_procesar = uploaded_files
+else:
+    def obtener_archivos_por_extension(ruta):
+        archivos = []
+        for root_dir, dirs, files in os.walk(ruta):
+            for file in files:
+                if file.lower().endswith(('.pdf', '.png', '.jpg', '.jpeg', '.xml')):
+                    archivos.append(os.path.join(root_dir, file))
+        return archivos
+
+    ruta_docs = st.text_input("Ruta de la carpeta local con los documentos", key="ruta_docs")
+    if ruta_docs and os.path.isdir(ruta_docs):
+        archivos_procesar = obtener_archivos_por_extension(ruta_docs)
+        st.success(f"Se detectaron {len(archivos_procesar)} archivos válidos.")
+    elif ruta_docs:
+        st.error("La ruta especificada no existe o no es una carpeta.")
 
 st.header("2. Confirmación")
 confirmacion = st.checkbox("Confirmo que he agregado todos los archivos necesarios para el cálculo.")
 
 if confirmacion:
-    if not archivos_nomina and not archivos_medicos:
+    if not archivos_procesar:
         st.warning("No se han cargado archivos para procesar.")
     elif st.button("Procesar Archivos"):
         with st.spinner("Extrayendo datos de los documentos..."):
-            df_resultados = procesar_documentos(archivos_nomina, archivos_medicos)
+            df_resultados = procesar_documentos(archivos_procesar, anio_declaracion)
             
             st.header("3. Resultados")
             st.dataframe(df_resultados, use_container_width=True)
@@ -116,12 +248,14 @@ if confirmacion:
             total_ingresos = df_resultados["Ingresos"].sum()
             total_isr = df_resultados["ISR Retenido"].sum()
             total_medicas = df_resultados["Deducciones Médicas"].sum()
+            total_escolares = df_resultados["Deducciones Escolares"].sum()
             
             st.subheader("Resumen")
-            col_res1, col_res2, col_res3 = st.columns(3)
+            col_res1, col_res2, col_res3, col_res4 = st.columns(4)
             col_res1.metric("Total Ingresos", f"${total_ingresos:,.2f}")
             col_res2.metric("Total ISR Retenido", f"${total_isr:,.2f}")
             col_res3.metric("Total Deducciones Médicas", f"${total_medicas:,.2f}")
+            col_res4.metric("Total Escolares", f"${total_escolares:,.2f}")
             
             csv = df_resultados.to_csv(index=False).encode('utf-8')
             st.download_button(
